@@ -54,7 +54,8 @@
 
         /* --- Camera Screen --- */
         #camera-screen {
-            display: none; position: relative; width: 100vw; height: 100vh;
+            display: none; position: relative; width: 100vw;
+            height: 100vh; height: 100dvh;
         }
         #video {
             width: 100%; height: 100%; object-fit: cover;
@@ -67,19 +68,23 @@
             pointer-events: none;
         }
 
-        /* HUD overlay */
+        /* HUD overlay — compact 2-column grid so record button stays visible */
         #hud {
             position: absolute; top: 0; left: 0; right: 0;
-            background: rgba(0,0,0,0.65); padding: 10px 14px;
-            font-size: 0.75em; z-index: 10;
+            background: rgba(0,0,0,0.65); padding: 8px 12px;
+            font-size: 0.7em; z-index: 10;
+            display: grid; grid-template-columns: 1fr 1fr; gap: 2px 12px;
+            max-height: 30vh; overflow: hidden;
         }
-        #hud .row { display: flex; justify-content: space-between; margin-bottom: 3px; }
+        #hud .row { display: flex; justify-content: space-between; }
         #hud .val { color: #4ade80; font-weight: 600; }
         #hud .label { color: #aaa; }
 
         /* Progress bar */
         #progress-container {
-            position: absolute; bottom: 100px; left: 20px; right: 20px;
+            position: absolute;
+            bottom: calc(100px + env(safe-area-inset-bottom, 0px));
+            left: 20px; right: 20px;
             height: 24px; background: rgba(255,255,255,0.1);
             border-radius: 12px; overflow: hidden; z-index: 10;
         }
@@ -95,22 +100,28 @@
 
         /* Guide arrow */
         #guide {
-            position: absolute; bottom: 140px; left: 0; right: 0;
+            position: absolute;
+            bottom: calc(140px + env(safe-area-inset-bottom, 0px));
+            left: 0; right: 0;
             text-align: center; font-size: 1.2em; font-weight: 700;
             color: #4ade80; z-index: 10;
         }
 
         /* Session info bar */
         #session-bar {
-            position: absolute; bottom: 50px; left: 0; right: 0;
+            position: absolute;
+            bottom: calc(55px + env(safe-area-inset-bottom, 0px));
+            left: 0; right: 0;
             text-align: center; z-index: 10;
         }
         #session-bar .info { color: #aaa; font-size: 0.8em; margin-bottom: 8px; }
 
-        /* Control buttons */
+        /* Control buttons — respect safe-area so Galaxy/Chrome bottom bar doesn't clip */
         #controls {
-            position: absolute; bottom: 10px; left: 0; right: 0;
-            display: flex; justify-content: center; gap: 10px; z-index: 10;
+            position: absolute;
+            bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+            left: 0; right: 0;
+            display: flex; justify-content: center; gap: 10px; z-index: 20;
         }
         #controls .btn { padding: 10px 24px; font-size: 0.9em; }
 
