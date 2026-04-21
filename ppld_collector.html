@@ -192,7 +192,7 @@
 
     <div id="hud">
         <div class="row"><span class="label">Area Ratio</span><span class="val" id="hud-area">1.0000</span></div>
-        <div class="row"><span class="label">Sub-bbox Diff</span><span class="val" id="hud-subbbox">1.0000</span></div>
+        <div class="row"><span class="label">LM SubBbox</span><span class="val" id="hud-subbbox">-</span></div>
         <div class="row"><span class="label">Est. dZ</span><span class="val" id="hud-dz">0.0 cm</span></div>
         <div class="row"><span class="label">Direction</span><span class="val" id="hud-dir">-</span></div>
         <div class="row"><span class="label">Tier</span><span class="val" id="hud-tier">-</span></div>
@@ -251,6 +251,9 @@ const JAWLINE = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397,
 const LEFT_EAR_REGION = [234, 127, 162, 21, 54];
 const RIGHT_EAR_REGION = [454, 356, 389, 251, 284];
 const FACE_CENTER = [1, 6, 168, 197, 195, 5, 4];
+// Jawline periphery: first 5 (left side) + last 5 (right side), skipping chin center
+const JAWLINE_LEFT_EDGE = [10, 338, 297, 332, 284];
+const JAWLINE_RIGHT_EDGE = [397, 365, 379, 378, 400];
 
 // ============================================================
 // FAGR Tracker (ported from Python fagr_tracker.py)
@@ -303,14 +306,10 @@ class FAGRTracker {
     }
 
     _computeSubBboxDiff() {
-        if (this.buffer.length < 5 || !this.reference) return 1.0;
-        const ref = this.reference;
-        const cur = this.buffer[this.buffer.length - 1];
-        const refThirdW = ref.w / 3.0;
-        const curThirdW = cur.w / 3.0;
-        const centerGrowth = (curThirdW * cur.h) / Math.max(refThirdW * ref.h, 1);
-        const edgeGrowth = (2 * curThirdW * cur.h) / Math.max(2 * refThirdW * ref.h, 1);
-        return edgeGrowth < 0.01 ? 1.0 : centerGrowth / edgeGrowth;
+        // NOTE: bbox-geometry sub-bbox is mathematically always 1.0 (center/edge cancel).
+        // This is now a placeholder; real sub-bbox differential uses landmarks
+        // via computeLandmarkSubBboxDiff() below. Kept for backward compat in state.
+        return 1.0;
     }
 
     _classifyMotion(ref, cur, areaRatio) {
@@ -347,11 +346,15 @@ class LandmarkFeatureExtractor {
     extract(lmStart, lmEnd, imgW, imgH) {
         const start = lmStart.map(l => [l.x * imgW, l.y * imgH]);
         const end = lmEnd.map(l => [l.x * imgW, l.y * imgH]);
+        const earVis = this._computeEarVisibility(lmStart, lmEnd);
         return {
             fnus: this._computeFNUS(start, end),
             cds: this._computeCDS(start, end),
             dms: this._computeDMS(start, end),
-            sos: this._computeSOS(start, end, lmStart, lmEnd),
+            sos: this._computeSOS(start, end),
+            lmSubBboxDiff: this.computeLandmarkSubBboxDiff(start, end),
+            earVisStart: earVis.startVis,
+            earVisEnd: earVis.endVis,
         };
     }
 
@@ -385,14 +388,31 @@ class LandmarkFeatureExtractor {
         return earScale < 1e-6 ? 1.0 : noseScale / earScale;
     }
 
-    _computeSOS(start, end, lmStartRaw, lmEndRaw) {
+    _computeSOS(start, end) {
+        // Always compute — earVisibility saved separately for post-analysis filtering
+        return this._earFaceRatio(start) - this._earFaceRatio(end);
+    }
+
+    _computeEarVisibility(lmStartRaw, lmEndRaw) {
         const earIndices = [...LEFT_EAR_REGION, ...RIGHT_EAR_REGION];
         const startVis = earIndices.map(i => lmStartRaw[i].visibility ?? 1.0);
         const endVis = earIndices.map(i => lmEndRaw[i].visibility ?? 1.0);
-        const avgStartVis = startVis.reduce((a,b) => a+b, 0) / startVis.length;
-        const avgEndVis = endVis.reduce((a,b) => a+b, 0) / endVis.length;
-        if (avgStartVis < this.earConfThreshold || avgEndVis < this.earConfThreshold) return null;
-        return this._earFaceRatio(start) - this._earFaceRatio(end);
+        return {
+            startVis: startVis.reduce((a,b) => a+b, 0) / startVis.length,
+            endVis: endVis.reduce((a,b) => a+b, 0) / endVis.length,
+        };
+    }
+
+    computeLandmarkSubBboxDiff(start, end) {
+        // Landmark-based center vs periphery scale change ratio
+        // Center = FACE_CENTER (forehead/nose mid-plane landmarks)
+        // Edge = JAWLINE left+right periphery (jaw sides)
+        // Differs from DMS which uses NOSE_REGION vs EAR_REGION (protrusion-based)
+        // On 3D face approaching: center magnifies faster → ratio > 1.0
+        // On 2D flat: uniform magnification → ratio ≈ 1.0
+        const centerScale = this._computeScaleChange(start, end, FACE_CENTER);
+        const edgeScale = this._computeScaleChange(start, end, [...JAWLINE_LEFT_EDGE, ...JAWLINE_RIGHT_EDGE]);
+        return edgeScale < 1e-6 ? 1.0 : centerScale / edgeScale;
     }
 
     _earFaceRatio(pts) {
@@ -469,26 +489,23 @@ function sigmoidMap(value, center, scale) {
 }
 
 function scoreTier1(state) {
-    if (state.subBboxDiff <= 1.0) return null;
-    const raw = (state.subBboxDiff - 1.0) / 0.05;
+    // Always compute — use lmSubBboxDiff if available, else areaRatio-based
+    const diff = state.lmSubBboxDiff ?? state.subBboxDiff;
+    if (diff <= 1.0) return 0.5;  // neutral score instead of null
+    const raw = (diff - 1.0) / 0.05;
     return 0.5 + 0.35 * Math.min(raw, 1.0);
 }
 
-function scoreTier2(state, fnus, cds, dms, sos) {
+function scoreTier2(state, fnus, cds, dms, sos, lmSubBboxDiff) {
+    const subBbox = lmSubBboxDiff ?? state.subBboxDiff ?? 1.0;
     const w = { fagr_sub_bbox: 0.25, fnus: 0.30, cds: 0.20, dms: 0.15, sos: 0.10 };
     const features = {
-        fagr_sub_bbox: sigmoidMap(state.subBboxDiff, 1.02, 50),
+        fagr_sub_bbox: sigmoidMap(subBbox, 1.02, 50),
         fnus: sigmoidMap(fnus, 0.05, 30),
         cds: sigmoidMap(cds, 0.003, 500),
         dms: sigmoidMap(dms - 1.0, 0.03, 50),
+        sos: sigmoidMap(sos, 0.01, 100),
     };
-    if (sos !== null && sos !== undefined) {
-        features.sos = sigmoidMap(sos, 0.01, 100);
-    } else {
-        delete w.sos;
-        const total = Object.values(w).reduce((a, b) => a + b, 0);
-        for (const k in w) w[k] /= total;
-    }
     let score = 0;
     for (const k in features) score += (w[k] || 0) * features[k];
     return Math.max(0, Math.min(1, score));
@@ -713,14 +730,17 @@ function processRecordingFrame(bbox, landmarks, imgW, imgH) {
     if (!startFrame) startFrame = captureFrameAsDataURL();
     endFrame = captureFrameAsDataURL();
 
-    // Compute Tier 2 features if enough motion
+    // Compute Tier 2 features always when landmarks available (no nFrames gate)
     let tier2Features = null;
-    if (tier2Enabled && startLandmarks && endLandmarks && state.nFrames >= 10) {
+    if (tier2Enabled && startLandmarks && endLandmarks) {
         tier2Features = landmarkExtractor.extract(startLandmarks, endLandmarks, imgW, imgH);
         row.fnus = tier2Features.fnus;
         row.cds = tier2Features.cds;
         row.dms = tier2Features.dms;
         row.sos = tier2Features.sos;
+        row.lmSubBboxDiff = tier2Features.lmSubBboxDiff;
+        row.earVisStart = tier2Features.earVisStart;
+        row.earVisEnd = tier2Features.earVisEnd;
     }
 
     sessionTrajectory.push(row);
@@ -741,20 +761,19 @@ function processRecordingFrame(bbox, landmarks, imgW, imgH) {
 
 function updateHUD(state, tier2Features) {
     document.getElementById('hud-area').textContent = state.areaRatio.toFixed(4);
-    document.getElementById('hud-subbbox').textContent = state.subBboxDiff.toFixed(4);
     document.getElementById('hud-dz').textContent = state.estimatedDzCm.toFixed(1) + ' cm';
     document.getElementById('hud-dir').textContent = state.direction;
 
     const t1 = scoreTier1(state);
-    document.getElementById('hud-t1').textContent = t1 !== null ? t1.toFixed(3) : '-';
+    document.getElementById('hud-t1').textContent = t1.toFixed(3);
 
     if (tier2Features) {
         document.getElementById('hud-tier').textContent = 'Tier 2';
+        document.getElementById('hud-subbbox').textContent = tier2Features.lmSubBboxDiff.toFixed(4);
         document.getElementById('hud-fnus').textContent = tier2Features.fnus.toFixed(4);
         document.getElementById('hud-cds').textContent = tier2Features.cds.toFixed(5);
         document.getElementById('hud-dms').textContent = tier2Features.dms.toFixed(4);
-        document.getElementById('hud-sos').textContent =
-            tier2Features.sos !== null ? tier2Features.sos.toFixed(4) : 'N/A';
+        document.getElementById('hud-sos').textContent = tier2Features.sos.toFixed(4);
     } else {
         document.getElementById('hud-tier').textContent = state.nFrames >= 5 ? 'Tier 1' : '-';
     }
@@ -818,7 +837,10 @@ function finishSession(finalState, tier2Features) {
         ppldFeatures.cds = feats.cds;
         ppldFeatures.dms = feats.dms;
         ppldFeatures.sos = feats.sos;
-        ppldFeatures.tier2Score = scoreTier2(finalState, feats.fnus, feats.cds, feats.dms, feats.sos);
+        ppldFeatures.lmSubBboxDiff = feats.lmSubBboxDiff;
+        ppldFeatures.earVisStart = feats.earVisStart;
+        ppldFeatures.earVisEnd = feats.earVisEnd;
+        ppldFeatures.tier2Score = scoreTier2(finalState, feats.fnus, feats.cds, feats.dms, feats.sos, feats.lmSubBboxDiff);
     }
 
     const sessionData = {
