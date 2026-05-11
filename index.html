@@ -1099,12 +1099,19 @@
             }
 
             btn.textContent = 'ZIP 생성 중... ' + (i + 1) + '/' + collectedSessions.length;
+            // Yield to event loop so iOS Safari's RenderProcessNotResponding
+            // watchdog doesn't kill the tab during the long zip-build path.
+            // Without this, building 10 sessions × AE-mode × multiframe on
+            // a single sync chunk pushes well past Safari's ~10s threshold.
+            await new Promise(function(resolve) { setTimeout(resolve, 0); });
         }
 
+        // PNG payload is already DEFLATE-compressed; running DEFLATE again
+        // wastes 10–30s of main-thread time for ~0% size benefit and is the
+        // direct cause of the iOS 18.4 page-refresh during compression.
         var blob = await zip.generateAsync({
             type: 'blob',
-            compression: 'DEFLATE',
-            compressionOptions: { level: 6 },
+            compression: 'STORE',
         });
 
         var url = URL.createObjectURL(blob);

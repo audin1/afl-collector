@@ -62,8 +62,10 @@
             transform: scaleX(-1);
         }
         #overlay {
-            position: absolute; top: 0; left: 0;
-            width: 100%; height: 100%;
+            /* Position/size set dynamically by syncOverlayToVideo() to match
+               the video's object-fit:cover fitted region exactly, so bbox
+               and landmark dots align with the underlying camera image. */
+            position: absolute;
             transform: scaleX(-1);
             pointer-events: none;
         }
@@ -203,7 +205,7 @@
         <div class="row"><span class="label">SOS</span><span class="val" id="hud-sos">-</span></div>
     </div>
 
-    <div id="guide">카메라에 천천히 다가가세요 →→→</div>
+    <div id="guide">아래 <b>녹화 시작</b> 버튼을 눌러 측정을 시작하세요</div>
 
     <div id="progress-container">
         <div id="progress-bar"></div>
@@ -265,6 +267,14 @@ class FAGRTracker {
         this.zRefCm = zRefCm;
         this.tier2DzThreshold = tier2DzThreshold;
         this.reference = null;
+        // Warmup: collect N stable detections before locking reference, so
+        // an initial unstable bbox (MediaPipe still settling, partial face,
+        // or phantom detection) cannot poison the entire session.
+        this.warmupCount = 5;
+        this.warmupStableTol = 0.10;  // areas within 10% of median = stable
+        // Sanity reset on impossible single-frame jump (handles user
+        // momentarily covering camera, face leaving frame, etc).
+        this.resyncJumpRatio = 5.0;
     }
 
     update(bbox) {
@@ -275,7 +285,33 @@ class FAGRTracker {
         };
         this.buffer.push(entry);
         if (this.buffer.length > this.maxFrames) this.buffer.shift();
-        if (!this.reference) this.reference = entry;
+
+        if (!this.reference) {
+            // Wait for warmupCount detections, then lock the median-area one
+            // as reference if at least 60% of recent frames cluster around it.
+            if (this.buffer.length >= this.warmupCount) {
+                const recent = this.buffer.slice(-this.warmupCount);
+                const sorted = recent.slice().sort((a, b) => a.area - b.area);
+                const median = sorted[Math.floor(sorted.length / 2)];
+                const stable = recent.filter(e =>
+                    Math.abs(e.area - median.area) / Math.max(median.area, 1) <= this.warmupStableTol
+                ).length;
+                if (stable >= Math.ceil(this.warmupCount * 0.6)) {
+                    this.reference = median;
+                }
+                // else: not stable yet — stay unreferenced, return neutral state
+            }
+        } else {
+            // Sanity reset: if a single frame's area jumps by >5x relative
+            // to the reference (face left/re-entered, occlusion, etc),
+            // treat the current frame as a new reference rather than letting
+            // dZ saturate and trigger spurious finishSession.
+            const ratio = entry.area / Math.max(this.reference.area, 1);
+            if (ratio > this.resyncJumpRatio || ratio < 1 / this.resyncJumpRatio) {
+                this.buffer = [entry];
+                this.reference = entry;
+            }
+        }
         return this._computeState();
     }
 
@@ -284,7 +320,7 @@ class FAGRTracker {
     _computeState() {
         if (this.buffer.length < 2 || !this.reference) {
             return {
-                areaRatio: 1.0, subBboxDiff: 1.0, direction: 'stationary',
+                areaRatio: 1.0, subBboxDiff: 1.0, direction: 'warming_up',
                 estimatedDzCm: 0.0, durationMs: 0, nFrames: this.buffer.length,
                 areaVelocity: 0.0, sufficientForTier2: false,
             };
@@ -612,6 +648,36 @@ window.startCollector = startCollector;
 // ============================================================
 let lastDetectTime = 0;
 
+// Resize overlay canvas to match video's object-fit:cover fitted region.
+// Without this, canvas inner coords (videoWidth × videoHeight) get stretched
+// onto a CSS box of different aspect ratio, causing bbox/landmark dots to
+// drift away from the actual face position on screen (most visible on
+// portrait phones where camera AR ≠ viewport AR, e.g. S25 1080×2340).
+function syncOverlayToVideo() {
+    const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+    if (!vw || !vh) return;
+    const rect = videoEl.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const vAR = vw / vh;
+    const eAR = rect.width / rect.height;
+    let fitW, fitH, offsetX, offsetY;
+    if (vAR > eAR) {
+        fitH = rect.height;
+        fitW = fitH * vAR;
+        offsetX = (rect.width - fitW) / 2;
+        offsetY = 0;
+    } else {
+        fitW = rect.width;
+        fitH = fitW / vAR;
+        offsetX = 0;
+        offsetY = (rect.height - fitH) / 2;
+    }
+    overlayCanvas.style.left = offsetX + 'px';
+    overlayCanvas.style.top = offsetY + 'px';
+    overlayCanvas.style.width = fitW + 'px';
+    overlayCanvas.style.height = fitH + 'px';
+}
+
 function detectLoop() {
     if (!videoEl || videoEl.paused || videoEl.ended) {
         animFrameId = requestAnimationFrame(detectLoop);
@@ -625,6 +691,7 @@ function detectLoop() {
     }
     lastDetectTime = now;
 
+    syncOverlayToVideo();
     const results = faceLandmarker.detectForVideo(videoEl, now);
     const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
     overlayCanvas.width = vw;
@@ -634,6 +701,18 @@ function detectLoop() {
     if (results.faceLandmarks && results.faceLandmarks.length > 0) {
         const landmarks = results.faceLandmarks[0];
         const bbox = landmarksToBbox(landmarks, vw, vh);
+        if (!bbox) {
+            // Degenerate landmarks — treat as no detection this frame.
+            if (isRecording) {
+                sessionTrajectory.push({
+                    frameIdx: sessionTrajectory.length,
+                    timestamp: (performance.now() - sessionStartTime) / 1000.0,
+                    faceDetected: false,
+                });
+            }
+            animFrameId = requestAnimationFrame(detectLoop);
+            return;
+        }
 
         // Draw bbox
         overlayCtx.strokeStyle = '#00ff88';
@@ -689,15 +768,27 @@ function detectLoop() {
 
 function landmarksToBbox(landmarks, w, h) {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let valid = 0;
     for (const lm of landmarks) {
         const x = lm.x * w, y = lm.y * h;
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
         if (x < minX) minX = x; if (y < minY) minY = y;
         if (x > maxX) maxX = x; if (y > maxY) maxY = y;
+        valid++;
     }
+    // Refuse to produce a bbox from a degenerate landmark set (NaN
+    // coordinates, all-collapsed, or fewer than ~10 valid points). The
+    // upstream root cause of the dZ=±270 / Area=-Infinity failure mode.
+    if (valid < 10 || maxX <= minX || maxY <= minY) return null;
     const pad = Math.max(maxX - minX, maxY - minY) * 0.05;
+    const bw = Math.min(w, maxX - minX + 2*pad);
+    const bh = Math.min(h, maxY - minY + 2*pad);
+    if (bw <= 1 || bh <= 1) return null;
     return {
-        x: Math.max(0, minX - pad), y: Math.max(0, minY - pad),
-        w: Math.min(w, maxX - minX + 2*pad), h: Math.min(h, maxY - minY + 2*pad),
+        x: Math.max(0, minX - pad),
+        y: Math.max(0, minY - pad),
+        w: bw,
+        h: bh,
     };
 }
 
@@ -870,6 +961,21 @@ function finishSession(finalState, tier2Features) {
         document.getElementById('btn-start').textContent = '\uB2E4\uC74C \uC138\uC158';
         document.getElementById('btn-start').style.display = 'inline-block';
         document.getElementById('btn-skip').style.display = 'none';
+        // After 1.5s, restore the pre-recording guide so the user knows to
+        // press the next button (not "approach camera" which only applies
+        // during active recording).
+        setTimeout(function() {
+            if (!isRecording) {
+                var g = document.getElementById('guide');
+                while (g.firstChild) g.removeChild(g.firstChild);
+                g.appendChild(document.createTextNode('\uC544\uB798 '));
+                var b = document.createElement('b');
+                b.textContent = '\uB2E4\uC74C \uC138\uC158';
+                g.appendChild(b);
+                g.appendChild(document.createTextNode(' \uBC84\uD2BC\uC744 \uB20C\uB7EC \uC9C4\uD589\uD558\uC138\uC694'));
+                g.style.color = '#4ade80';
+            }
+        }, 1500);
     }
 }
 
