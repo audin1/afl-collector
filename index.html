@@ -519,6 +519,10 @@
     }
 
     // --- Frame Capture ---
+    // Returns the live canvas; caller is responsible for converting it to a
+    // Blob and dropping the canvas reference so iOS Safari can free heap.
+    // We DO NOT hold base64 dataURLs (was the iPhone 13 OOM root cause —
+    // 10 sessions of dataURLs sat as ~100MB of string in JS heap).
 
     async function captureFrame() {
         const timestamp = performance.now();
@@ -531,11 +535,11 @@
                 canvas.height = bitmap.height;
                 const ctx = canvas.getContext('2d');
                 ctx.drawImage(bitmap, 0, 0);
-
+                bitmap.close && bitmap.close();
                 return {
-                    dataURL: canvas.toDataURL('image/png'),
-                    width: bitmap.width,
-                    height: bitmap.height,
+                    canvas: canvas,
+                    width: canvas.width,
+                    height: canvas.height,
                     timestamp: timestamp,
                 };
             } catch (e) {
@@ -543,7 +547,6 @@
             }
         }
 
-        // Canvas fallback
         const video = document.getElementById('camera-video');
         const canvas = document.createElement('canvas');
         canvas.width = video.videoWidth;
@@ -552,11 +555,19 @@
         ctx.drawImage(video, 0, 0);
 
         return {
-            dataURL: canvas.toDataURL('image/png'),
+            canvas: canvas,
             width: canvas.width,
             height: canvas.height,
             timestamp: timestamp,
         };
+    }
+
+    function canvasToBlob(canvas) {
+        // Wrap canvas.toBlob in a Promise. Returns a Blob whose binary data
+        // is browser-managed (off-heap), keeping JS heap pressure minimal.
+        return new Promise(function(resolve) {
+            canvas.toBlob(function(blob) { resolve(blob); }, 'image/png');
+        });
     }
 
     // --- Flash Sequence ---
@@ -618,43 +629,32 @@
 
     // --- Brightness Measurement ---
 
-    function measureBrightness(dataURL) {
-        // Measure average brightness from captured frame (center face region)
-        return new Promise(function(resolve) {
-            var img = new Image();
-            img.onload = function() {
-                var canvas = document.createElement('canvas');
-                // Sample center 40% region (approximate face area)
-                var sampleW = Math.floor(img.width * 0.4);
-                var sampleH = Math.floor(img.height * 0.4);
-                canvas.width = sampleW;
-                canvas.height = sampleH;
-                var ctx = canvas.getContext('2d');
-                var sx = Math.floor((img.width - sampleW) / 2);
-                var sy = Math.floor((img.height - sampleH) / 2);
-                ctx.drawImage(img, sx, sy, sampleW, sampleH, 0, 0, sampleW, sampleH);
-
-                var imageData = ctx.getImageData(0, 0, sampleW, sampleH);
-                var data = imageData.data;
-                var rSum = 0, gSum = 0, bSum = 0;
-                var pixelCount = data.length / 4;
-                for (var i = 0; i < data.length; i += 4) {
-                    rSum += data[i];
-                    gSum += data[i + 1];
-                    bSum += data[i + 2];
-                }
-                resolve({
-                    brightness: (rSum + gSum + bSum) / (3 * pixelCount),
-                    meanR: rSum / pixelCount,
-                    meanG: gSum / pixelCount,
-                    meanB: bSum / pixelCount,
-                });
-            };
-            img.onerror = function() {
-                resolve({ brightness: 0, meanR: 0, meanG: 0, meanB: 0 });
-            };
-            img.src = dataURL;
-        });
+    function measureBrightness(canvas) {
+        // Read the center 40% region (approximate face area) directly from
+        // the source canvas. Synchronous — no Image element, no dataURL
+        // round-trip, no second canvas allocation. Caller must still hold
+        // the canvas alive until this returns.
+        var w = canvas.width, h = canvas.height;
+        var sampleW = Math.floor(w * 0.4);
+        var sampleH = Math.floor(h * 0.4);
+        var sx = Math.floor((w - sampleW) / 2);
+        var sy = Math.floor((h - sampleH) / 2);
+        var ctx = canvas.getContext('2d');
+        var imageData = ctx.getImageData(sx, sy, sampleW, sampleH);
+        var data = imageData.data;
+        var rSum = 0, gSum = 0, bSum = 0;
+        var pixelCount = data.length / 4;
+        for (var i = 0; i < data.length; i += 4) {
+            rSum += data[i];
+            gSum += data[i + 1];
+            bSum += data[i + 2];
+        }
+        return {
+            brightness: (rSum + gSum + bSum) / (3 * pixelCount),
+            meanR: rSum / pixelCount,
+            meanG: gSum / pixelCount,
+            meanB: bSum / pixelCount,
+        };
     }
 
     // --- Ambient Measurement ---
@@ -664,7 +664,9 @@
         var measurements = [];
         for (var i = 0; i < 3; i++) {
             var capture = await captureFrame();
-            var brightness = await measureBrightness(capture.dataURL);
+            var brightness = measureBrightness(capture.canvas);
+            // Ambient measurement is throwaway — release canvas immediately.
+            capture.canvas = null;
             measurements.push(brightness);
             await sleep(100);
         }
@@ -715,16 +717,20 @@
             // Wait for light to reach face and camera to capture
             await sleep(40);
 
-            // Capture multiple frames during flash
+            // Capture multiple frames during flash. We measure brightness
+            // synchronously off the canvas, encode the canvas to a Blob
+            // (browser-managed, off-heap), then drop the canvas reference
+            // so it can be garbage-collected before the next iteration.
             var multiCaptures = [];
             for (var fc = 0; fc < framesPerFlash; fc++) {
                 var capture = await captureFrame();
-                var brightness = await measureBrightness(capture.dataURL);
+                var brightness = measureBrightness(capture.canvas);
+                var blob = await canvasToBlob(capture.canvas);
                 multiCaptures.push({
                     captureIndex: fc,
                     captureTimestamp: capture.timestamp,
                     latencyMs: capture.timestamp - flashTime,
-                    dataURL: capture.dataURL,
+                    blob: blob,
                     width: capture.width,
                     height: capture.height,
                     brightness: brightness.brightness,
@@ -732,6 +738,7 @@
                     meanG: brightness.meanG,
                     meanB: brightness.meanB,
                 });
+                capture.canvas = null;
                 // Small delay between multi-frame captures
                 if (fc < framesPerFlash - 1) await sleep(10);
             }
@@ -762,7 +769,7 @@
                 flashTimestamp: flashTime,
                 captureTimestamp: primary.captureTimestamp,
                 latencyMs: primary.latencyMs,
-                dataURL: primary.dataURL,
+                blob: primary.blob,
                 width: primary.width,
                 height: primary.height,
                 brightness: avgBrightness,
@@ -773,8 +780,9 @@
                 multiFrameBrightness: multiCaptures.map(function(c) {
                     return { brightness: c.brightness, meanR: c.meanR, meanG: c.meanG, meanB: c.meanB, latencyMs: c.latencyMs };
                 }),
-                // Store all capture dataURLs for multi-frame analysis
-                multiFrameDataURLs: multiCaptures.map(function(c) { return c.dataURL; }),
+                // Store all capture blobs for multi-frame analysis (browser-
+                // managed off-heap binary, far less GC pressure than dataURLs).
+                multiFrameBlobs: multiCaptures.map(function(c) { return c.blob; }),
             });
 
             statusText.textContent = passLabel + ' ' + (i + 1) + '/' + challenge.frames.length;
@@ -1046,7 +1054,9 @@
 
             zip.file(sessionDir + '/metadata.json', JSON.stringify(metadata, null, 2));
 
-            // Save Pass 1 frame images (locked)
+            // Save Pass 1 frame images (locked). JSZip accepts Blob directly,
+            // skipping the base64 → decode round-trip that previously doubled
+            // peak heap usage during ZIP build.
             for (var j = 0; j < session.frames.length; j++) {
                 var frame = session.frames[j];
                 var fname;
@@ -1054,19 +1064,16 @@
                 else if (frame.type === 'calibration') fname = 'calibration.png';
                 else fname = 'flash_' + String(frame.frameId).padStart(3, '0') + '.png';
 
-                var base64 = frame.dataURL.split(',')[1];
-                zip.file(sessionDir + '/' + fname, base64, { base64: true });
+                zip.file(sessionDir + '/' + fname, frame.blob);
 
-                // Save multi-frame captures
-                if (frame.multiFrameDataURLs && frame.multiFrameDataURLs.length > 1) {
-                    for (var mf = 0; mf < frame.multiFrameDataURLs.length; mf++) {
+                if (frame.multiFrameBlobs && frame.multiFrameBlobs.length > 1) {
+                    for (var mf = 0; mf < frame.multiFrameBlobs.length; mf++) {
                         var mfBase;
                         if (frame.type === 'baseline') mfBase = 'baseline';
                         else if (frame.type === 'calibration') mfBase = 'calibration';
                         else mfBase = 'flash_' + String(frame.frameId).padStart(3, '0');
                         var mfName = 'multiframe/' + mfBase + '_f' + mf + '.png';
-                        var mfB64 = frame.multiFrameDataURLs[mf].split(',')[1];
-                        zip.file(sessionDir + '/' + mfName, mfB64, { base64: true });
+                        zip.file(sessionDir + '/' + mfName, frame.multiFrameBlobs[mf]);
                     }
                 }
             }
@@ -1080,19 +1087,16 @@
                     else if (aeFrame.type === 'calibration') aeFname = 'ae_auto_calibration.png';
                     else aeFname = 'ae_auto_flash_' + String(aeFrame.frameId).padStart(3, '0') + '.png';
 
-                    var aeBase64 = aeFrame.dataURL.split(',')[1];
-                    zip.file(sessionDir + '/' + aeFname, aeBase64, { base64: true });
+                    zip.file(sessionDir + '/' + aeFname, aeFrame.blob);
 
-                    // Save Pass 2 multi-frame captures
-                    if (aeFrame.multiFrameDataURLs && aeFrame.multiFrameDataURLs.length > 1) {
-                        for (var mf2 = 0; mf2 < aeFrame.multiFrameDataURLs.length; mf2++) {
+                    if (aeFrame.multiFrameBlobs && aeFrame.multiFrameBlobs.length > 1) {
+                        for (var mf2 = 0; mf2 < aeFrame.multiFrameBlobs.length; mf2++) {
                             var mf2Base;
                             if (aeFrame.type === 'baseline') mf2Base = 'ae_auto_baseline';
                             else if (aeFrame.type === 'calibration') mf2Base = 'ae_auto_calibration';
                             else mf2Base = 'ae_auto_flash_' + String(aeFrame.frameId).padStart(3, '0');
                             var mf2Name = 'multiframe/' + mf2Base + '_f' + mf2 + '.png';
-                            var mf2B64 = aeFrame.multiFrameDataURLs[mf2].split(',')[1];
-                            zip.file(sessionDir + '/' + mf2Name, mf2B64, { base64: true });
+                            zip.file(sessionDir + '/' + mf2Name, aeFrame.multiFrameBlobs[mf2]);
                         }
                     }
                 }
