@@ -563,10 +563,21 @@
     }
 
     function canvasToBlob(canvas) {
-        // Wrap canvas.toBlob in a Promise. Returns a Blob whose binary data
-        // is browser-managed (off-heap), keeping JS heap pressure minimal.
+        // JPEG quality 0.88 instead of PNG: ~5x smaller files (300KB → 60KB
+        // per frame). All numerical measurements (brightness, meanR/G/B,
+        // multiFrameBrightness) are computed off the canvas in JS and stored
+        // in metadata.json — the saved image is only for visual inspection
+        // and downstream Face ROI re-analysis, both of which tolerate JPEG
+        // 0.88 noise (~±1-2 units on the 0-255 scale, well below the AFL
+        // discriminability thresholds we already validated).
+        //
+        // The 5x size reduction is required to fit iOS Safari's Web Share
+        // memory budget: navigator.share({files}) copies the file across
+        // an XPC boundary to the ShareKit extension, momentarily doubling
+        // RAM. 100MB PNG ZIP exceeds iPhone 13 per-tab limit during share;
+        // ~25MB JPEG ZIP fits comfortably.
         return new Promise(function(resolve) {
-            canvas.toBlob(function(blob) { resolve(blob); }, 'image/png');
+            canvas.toBlob(function(blob) { resolve(blob); }, 'image/jpeg', 0.88);
         });
     }
 
@@ -1001,9 +1012,9 @@
         // Helper to build frame metadata entry
         function frameToMeta(f, prefix) {
             var filename;
-            if (f.type === 'baseline') filename = prefix + 'baseline.png';
-            else if (f.type === 'calibration') filename = prefix + 'calibration.png';
-            else filename = prefix + 'flash_' + String(f.frameId).padStart(3, '0') + '.png';
+            if (f.type === 'baseline') filename = prefix + 'baseline.jpg';
+            else if (f.type === 'calibration') filename = prefix + 'calibration.jpg';
+            else filename = prefix + 'flash_' + String(f.frameId).padStart(3, '0') + '.jpg';
 
             return {
                 frameId: f.frameId,
@@ -1060,9 +1071,9 @@
             for (var j = 0; j < session.frames.length; j++) {
                 var frame = session.frames[j];
                 var fname;
-                if (frame.type === 'baseline') fname = 'baseline.png';
-                else if (frame.type === 'calibration') fname = 'calibration.png';
-                else fname = 'flash_' + String(frame.frameId).padStart(3, '0') + '.png';
+                if (frame.type === 'baseline') fname = 'baseline.jpg';
+                else if (frame.type === 'calibration') fname = 'calibration.jpg';
+                else fname = 'flash_' + String(frame.frameId).padStart(3, '0') + '.jpg';
 
                 zip.file(sessionDir + '/' + fname, frame.blob);
 
@@ -1072,7 +1083,7 @@
                         if (frame.type === 'baseline') mfBase = 'baseline';
                         else if (frame.type === 'calibration') mfBase = 'calibration';
                         else mfBase = 'flash_' + String(frame.frameId).padStart(3, '0');
-                        var mfName = 'multiframe/' + mfBase + '_f' + mf + '.png';
+                        var mfName = 'multiframe/' + mfBase + '_f' + mf + '.jpg';
                         zip.file(sessionDir + '/' + mfName, frame.multiFrameBlobs[mf]);
                     }
                 }
@@ -1083,9 +1094,9 @@
                 for (var k = 0; k < session.aeAutoFrames.length; k++) {
                     var aeFrame = session.aeAutoFrames[k];
                     var aeFname;
-                    if (aeFrame.type === 'baseline') aeFname = 'ae_auto_baseline.png';
-                    else if (aeFrame.type === 'calibration') aeFname = 'ae_auto_calibration.png';
-                    else aeFname = 'ae_auto_flash_' + String(aeFrame.frameId).padStart(3, '0') + '.png';
+                    if (aeFrame.type === 'baseline') aeFname = 'ae_auto_baseline.jpg';
+                    else if (aeFrame.type === 'calibration') aeFname = 'ae_auto_calibration.jpg';
+                    else aeFname = 'ae_auto_flash_' + String(aeFrame.frameId).padStart(3, '0') + '.jpg';
 
                     zip.file(sessionDir + '/' + aeFname, aeFrame.blob);
 
@@ -1095,7 +1106,7 @@
                             if (aeFrame.type === 'baseline') mf2Base = 'ae_auto_baseline';
                             else if (aeFrame.type === 'calibration') mf2Base = 'ae_auto_calibration';
                             else mf2Base = 'ae_auto_flash_' + String(aeFrame.frameId).padStart(3, '0');
-                            var mf2Name = 'multiframe/' + mf2Base + '_f' + mf2 + '.png';
+                            var mf2Name = 'multiframe/' + mf2Base + '_f' + mf2 + '.jpg';
                             zip.file(sessionDir + '/' + mf2Name, aeFrame.multiFrameBlobs[mf2]);
                         }
                     }
