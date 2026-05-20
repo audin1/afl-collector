@@ -162,7 +162,7 @@
 
     <div class="option-group">
         <label>세션 수</label>
-        <input type="number" id="session-count" value="10" min="1" max="200">
+        <input type="number" id="session-count" value="5" min="1" max="200">
     </div>
 
     <div class="option-group">
@@ -173,6 +173,24 @@
     <div class="option-group">
         <label>최대 녹화 시간 (초)</label>
         <input type="number" id="max-duration" value="8" min="3" max="20" step="1">
+    </div>
+
+    <div class="option-group">
+        <label>환경 (Environment)</label>
+        <select id="env">
+            <option value="office">사무실 (office)</option>
+            <option value="dark">어두운 방 (dark)</option>
+            <option value="outdoor">밝은 야외 그늘 (outdoor)</option>
+            <option value="other">기타 (other)</option>
+        </select>
+    </div>
+
+    <div class="option-group">
+        <label>측정 모드 (Measurement mode)</label>
+        <select id="measurement-mode">
+            <option value="natural">자연 호흡 (default) — natural</option>
+            <option value="still">정면 정지 (controlled) — still</option>
+        </select>
     </div>
 
     <div class="option-group">
@@ -575,12 +593,17 @@ let endFrame = null;
 // ============================================================
 // Initialization
 // ============================================================
+let env = 'office';
+let measurementMode = 'natural';
+
 async function startCollector() {
     collectType = document.getElementById('collect-type').value;
     totalSessions = parseInt(document.getElementById('session-count').value);
     targetDzCm = parseFloat(document.getElementById('target-dz').value);
     maxDurationSec = parseFloat(document.getElementById('max-duration').value);
     tier2Enabled = document.getElementById('tier2-enabled').checked;
+    env = document.getElementById('env').value;
+    measurementMode = document.getElementById('measurement-mode').value;
 
     const statusEl = document.getElementById('model-status');
     statusEl.textContent = 'MediaPipe Face Landmarker 로딩 중...';
@@ -938,6 +961,8 @@ function finishSession(finalState, tier2Features) {
         sessionId: currentSessionIdx,
         collectType: collectType,
         tier2Enabled: tier2Enabled,
+        env: env,
+        measurementMode: measurementMode,
         resolution: imgW + 'x' + imgH,
         durationMs: performance.now() - sessionStartTime,
         totalFrames: sessionTrajectory.length,
@@ -1095,7 +1120,7 @@ async function downloadData() {
     var a = document.createElement('a');
     a.href = url;
     var dateStr = new Date().toISOString().slice(0, 10);
-    a.download = 'ppld_data_' + collectType + '_' + dateStr + '.zip';
+    a.download = 'ppld_data_' + collectType + '_' + env + '_' + measurementMode + '_' + dateStr + '.zip';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);

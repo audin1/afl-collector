@@ -246,7 +246,17 @@
 
         <div class="option-group">
             <label>수집할 세션 수</label>
-            <input type="number" id="session-count" value="10" min="1" max="100">
+            <input type="number" id="session-count" value="5" min="1" max="100">
+        </div>
+
+        <div class="option-group">
+            <label>환경 (Environment)</label>
+            <select id="env">
+                <option value="office">사무실 (office)</option>
+                <option value="dark">어두운 방 (dark)</option>
+                <option value="outdoor">밝은 야외 그늘 (outdoor)</option>
+                <option value="other">기타 (other)</option>
+            </select>
         </div>
 
         <div class="option-group" id="ae-analysis-group">
@@ -348,6 +358,7 @@
     let flashCount = 4;
     let flashDuration = 150;
     let aeAnalysisMode = false;
+    let env = 'office';
     let flashAlphaMode = 'T2';
     let flashAlpha = 0.10;  // current effective alpha
     let ambientBrightness = null;  // measured before flash sequence
@@ -821,6 +832,7 @@
             flashDuration: flashDuration,
             flashAlphaMode: flashAlphaMode,
             flashAlpha: flashAlpha,
+            env: env,
             deviceInfo: getDeviceInfo(),
             startTime: performance.now(),
         };
@@ -1129,7 +1141,7 @@
             compression: 'STORE',
         });
 
-        var filename = 'afl_data_' + collectType + '_' +
+        var filename = 'afl_data_' + collectType + '_' + env + '_' +
                        new Date().toISOString().slice(0, 10) + '.zip';
 
         // iOS Safari does not handle `<a download href=blob:...>` reliably
@@ -1182,6 +1194,7 @@
         flashDuration = parseInt(document.getElementById('flash-duration').value);
         totalSessions = parseInt(document.getElementById('session-count').value);
         aeAnalysisMode = document.getElementById('ae-analysis-mode').checked;
+        env = document.getElementById('env').value;
         flashAlphaMode = document.getElementById('flash-alpha-mode').value;
         if (flashAlphaMode === 'custom') {
             flashAlpha = parseFloat(document.getElementById('custom-alpha').value);
